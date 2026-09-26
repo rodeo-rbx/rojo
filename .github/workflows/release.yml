@@ -4,6 +4,10 @@ on:
   push:
     tags: ["v*"]
 
+# The fork's default workflow token is read-only.
+permissions:
+  contents: write
+
 jobs:
   create-release:
     name: Create Release
