@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    ffi::OsString,
     io::{BufWriter, Write},
     mem::forget,
     path::{self, Path, PathBuf},
@@ -249,9 +250,26 @@ fn write_sourcemap(
     );
 
     if let Some(output_path) = output {
-        let mut file = BufWriter::new(File::create(output_path)?);
-        serde_json::to_writer(&mut file, &root_node)?;
-        file.flush()?;
+        // Write to a temporary file next to the output and rename it over the
+        // output. The rename is atomic, so tools reading the sourcemap while
+        // it's rewritten see either the old one or the new one, never a
+        // truncated file. The temporary file's name is fixed so that one left
+        // behind by a killed process is overwritten by the next write.
+        let mut temp_name = OsString::from(".");
+        temp_name.push(
+            output_path
+                .file_name()
+                .context("The sourcemap output path has no file name")?,
+        );
+        temp_name.push(".tmp");
+        let temp_path = output_path.with_file_name(temp_name);
+
+        {
+            let mut file = BufWriter::new(File::create(&temp_path)?);
+            serde_json::to_writer(&mut file, &root_node)?;
+            file.flush()?;
+        }
+        fs_err::rename(&temp_path, output_path)?;
 
         println!("Created sourcemap at {}", output_path.display());
     } else {
@@ -267,7 +285,51 @@ mod test {
     use crate::cli::sourcemap::SourcemapNode;
     use crate::cli::SourcemapCommand;
     use insta::internals::Content;
+    use std::io::Read;
     use std::path::Path;
+
+    #[test]
+    fn replaces_the_output_instead_of_rewriting_it() {
+        let sourcemap_dir = tempfile::tempdir().unwrap();
+        let sourcemap_output = sourcemap_dir.path().join("sourcemap.json");
+        fs_err::write(&sourcemap_output, "old sourcemap").unwrap();
+        // Left behind by a process that was killed while writing.
+        fs_err::write(sourcemap_dir.path().join(".sourcemap.json.tmp"), "partial").unwrap();
+
+        // A tool that opened the old sourcemap just before it was rewritten.
+        let mut reader = fs_err::File::open(&sourcemap_output).unwrap();
+
+        let project_path = fs_err::canonicalize(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("test-projects")
+                .join("relative_paths")
+                .join("project"),
+        )
+        .unwrap();
+        let sourcemap_command = SourcemapCommand {
+            project: project_path,
+            output: Some(sourcemap_output.clone()),
+            include_non_scripts: false,
+            watch: false,
+            absolute: false,
+        };
+        assert!(sourcemap_command.run().is_ok());
+
+        // Rewriting the file in place would truncate it under the reader.
+        let mut old_contents = String::new();
+        reader.read_to_string(&mut old_contents).unwrap();
+        assert_eq!(old_contents, "old sourcemap");
+
+        let raw_sourcemap_contents = fs_err::read_to_string(&sourcemap_output).unwrap();
+        serde_json::from_str::<SourcemapNode>(&raw_sourcemap_contents).unwrap();
+
+        // Both the stale temporary file and the new one were renamed into place.
+        let file_names: Vec<_> = fs_err::read_dir(sourcemap_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(file_names, ["sourcemap.json"]);
+    }
 
     #[test]
     fn maps_relative_paths() {
