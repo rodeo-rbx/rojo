@@ -33,6 +33,7 @@ Making a new release? Simply add the new header with the version and date undern
 
 * Fixed `rojo serve` and `rojo sourcemap --watch` crashing when a watched directory is removed. ([rodeo-rbx/rwork#4])
 * `rojo sourcemap` now replaces its output file atomically, so tools reading the sourcemap while `--watch` rewrites it no longer see a truncated file. ([rodeo-rbx/rwork#5])
+* Fixed `rojo sourcemap --watch` crashing when an instance is added and removed again while the sourcemap is being written.
 
 [rodeo-rbx/rwork#4]: https://github.com/rodeo-rbx/rwork/issues/4
 [rodeo-rbx/rwork#5]: https://github.com/rodeo-rbx/rwork/issues/5
