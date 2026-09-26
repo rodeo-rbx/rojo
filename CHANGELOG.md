@@ -31,6 +31,10 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Fixed `rojo serve` and `rojo sourcemap --watch` crashing when a watched directory is removed. ([rodeo-rbx/rwork#4])
+
+[rodeo-rbx/rwork#4]: https://github.com/rodeo-rbx/rwork/issues/4
+
 ## [7.7.0] (July 1st, 2026)
 
 * `inf` and `nan` values in properties are now synced ([#1176])

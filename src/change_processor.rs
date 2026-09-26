@@ -2,7 +2,7 @@ use crossbeam_channel::{select, Receiver, RecvError, Sender};
 use jod_thread::JoinHandle;
 use memofs::{IoResultExt, Vfs, VfsEvent};
 use rbx_dom_weak::types::{Ref, Variant};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{
     fs,
     sync::{Arc, Mutex},
@@ -169,14 +169,15 @@ impl JobThreadContext {
         // of the tree. Calculate and apply all of these changes.
         let applied_patches = match event {
             VfsEvent::Create(path) | VfsEvent::Write(path) => {
-                self.apply_patches(self.vfs.canonicalize(&path).unwrap())
+                self.apply_patches(canonicalize_existing_prefix(&self.vfs, &path))
             }
             VfsEvent::Remove(path) => {
-                // MemoFS does not track parent removals yet, so we can canonicalize
-                // the parent path safely and then append the removed path's file name.
+                // The removed path itself can't be canonicalized, so canonicalize
+                // its parent and append the removed path's file name. The parent
+                // may be gone too when a whole directory is removed.
                 let parent = path.parent().unwrap();
                 let file_name = path.file_name().unwrap();
-                let parent_normalized = self.vfs.canonicalize(parent).unwrap();
+                let parent_normalized = canonicalize_existing_prefix(&self.vfs, parent);
                 self.apply_patches(parent_normalized.join(file_name))
             }
             _ => {
@@ -382,4 +383,92 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
     };
 
     Some(applied_patch_set)
+}
+
+/// Canonicalizes `path` through its deepest ancestor that still exists.
+///
+/// Watcher events can outlive the paths they describe. When a directory is
+/// removed, the events for the files inside it arrive after the directory
+/// itself is gone, and a created file can be deleted again before its event is
+/// handled. Canonicalizing those paths directly fails, but the change still has
+/// to be applied at the normalized location of whatever used to be there.
+fn canonicalize_existing_prefix(vfs: &Vfs, path: &Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        if let Ok(canonical) = vfs.canonicalize(ancestor) {
+            return match path.strip_prefix(ancestor) {
+                Ok(rest) if !rest.as_os_str().is_empty() => canonical.join(rest),
+                _ => canonical,
+            };
+        }
+    }
+
+    path.to_path_buf()
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    use memofs::{InMemoryFs, VfsSnapshot};
+
+    /// `/root/src/keep.luau`, with `/root` and `/root/src` as real directories.
+    fn vfs_with_project() -> Vfs {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/root",
+            VfsSnapshot::dir([(
+                "src",
+                VfsSnapshot::dir([("keep.luau", VfsSnapshot::file("return 1"))]),
+            )]),
+        )
+        .unwrap();
+        Vfs::new(imfs)
+    }
+
+    #[test]
+    fn canonicalize_existing_prefix_existing_path() {
+        let vfs = vfs_with_project();
+
+        assert_eq!(
+            canonicalize_existing_prefix(&vfs, Path::new("/root/./src/keep.luau")),
+            PathBuf::from("/root/src/keep.luau")
+        );
+    }
+
+    #[test]
+    fn canonicalize_existing_prefix_removed_directory() {
+        // The remove events for `dir/sub/b.luau` and `dir/sub` arrive after
+        // `dir` has already been deleted. The `./` makes these fail unless the
+        // existing ancestor is canonicalized and the rest appended to it.
+        let vfs = vfs_with_project();
+
+        assert_eq!(
+            canonicalize_existing_prefix(&vfs, Path::new("/root/./src/dir/sub/b.luau")),
+            PathBuf::from("/root/src/dir/sub/b.luau")
+        );
+        assert_eq!(
+            canonicalize_existing_prefix(&vfs, Path::new("/root/./src/dir/sub")),
+            PathBuf::from("/root/src/dir/sub")
+        );
+    }
+
+    #[test]
+    fn canonicalize_existing_prefix_normalizes_the_existing_part() {
+        let vfs = vfs_with_project();
+
+        assert_eq!(
+            canonicalize_existing_prefix(&vfs, Path::new("/root/src/../src/gone/file.luau")),
+            PathBuf::from("/root/src/gone/file.luau")
+        );
+    }
+
+    #[test]
+    fn canonicalize_existing_prefix_nothing_exists() {
+        let vfs = vfs_with_project();
+
+        assert_eq!(
+            canonicalize_existing_prefix(&vfs, Path::new("/elsewhere/file.luau")),
+            PathBuf::from("/elsewhere/file.luau")
+        );
+    }
 }

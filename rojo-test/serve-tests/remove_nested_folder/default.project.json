@@ -1,0 +1,6 @@
+{
+  "name": "remove_nested_folder",
+  "tree": {
+    "$path": "src"
+  }
+}

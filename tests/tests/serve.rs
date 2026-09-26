@@ -1,4 +1,7 @@
-use std::fs;
+use std::{
+    fs, thread,
+    time::{Duration, Instant},
+};
 
 use insta::{assert_snapshot, assert_yaml_snapshot, with_settings};
 use rbx_dom_weak::types::Ref;
@@ -194,6 +197,47 @@ fn remove_file() {
             read_response.intern_and_redact(&mut redactions, root_id)
         );
     });
+}
+
+#[test]
+fn remove_nested_folder() {
+    run_serve_test("remove_nested_folder", |session, _| {
+        let root_id = session.get_api_rojo().unwrap().root_instance_id;
+
+        let child_names = || {
+            let read_response = session.get_api_read(root_id).unwrap();
+            let mut names: Vec<String> = read_response.instances[&root_id]
+                .children
+                .iter()
+                .map(|id| read_response.instances[id].name.to_string())
+                .collect();
+            names.sort();
+            names
+        };
+
+        assert_eq!(child_names(), ["dir", "keep"]);
+
+        // The watcher reports the nested files after their directories are
+        // already gone, which used to crash the change processor.
+        fs::remove_dir_all(session.path().join("src/dir")).unwrap();
+        wait_until("dir to be removed", || child_names() == ["keep"]);
+
+        // Changes keep syncing after the removal.
+        fs::write(session.path().join("src/added.txt"), "added").unwrap();
+        wait_until("added to be created", || child_names() == ["added", "keep"]);
+    });
+}
+
+fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let start = Instant::now();
+
+    while !condition() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "Timed out waiting for {what}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]
