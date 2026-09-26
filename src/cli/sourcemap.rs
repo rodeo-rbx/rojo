@@ -1,10 +1,13 @@
 use std::{
     borrow::Cow,
     ffi::OsString,
-    io::{BufWriter, Write},
+    io::{self, BufWriter, Write},
     mem::forget,
     path::{self, Path, PathBuf},
 };
+
+#[cfg(windows)]
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Parser;
@@ -265,7 +268,13 @@ fn write_sourcemap(
             serde_json::to_writer(&mut file, &root_node)?;
             file.flush()?;
         }
-        fs_err::rename(&temp_path, output_path)?;
+        replace_file(&temp_path, output_path).with_context(|| {
+            format!(
+                "Failed to replace {} with {}",
+                output_path.display(),
+                temp_path.display()
+            )
+        })?;
 
         println!("Created sourcemap at {}", output_path.display());
     } else {
@@ -274,6 +283,38 @@ fn write_sourcemap(
     }
 
     Ok(())
+}
+
+/// Renames `from` over `to`, replacing it.
+///
+/// On Windows, a file can't be replaced while another process has it open
+/// without sharing delete access, which is how many programs read files. They
+/// only hold it for as long as a read takes, so retry for a moment.
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const RETRY_FOR: Duration = Duration::from_secs(2);
+
+        let start = Instant::now();
+        loop {
+            match std::fs::rename(from, to) {
+                Err(err)
+                    if matches!(
+                        err.raw_os_error(),
+                        Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+                    ) && start.elapsed() < RETRY_FOR =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    std::fs::rename(from, to)
 }
 
 #[cfg(test)]
@@ -287,6 +328,41 @@ mod test {
     use rbx_dom_weak::types::Ref;
     use std::io::Read;
     use std::path::Path;
+
+    #[cfg(windows)]
+    #[test]
+    fn replace_file_waits_for_readers_that_block_replacing() {
+        use std::{os::windows::fs::OpenOptionsExt, thread, time::Duration};
+
+        // Programs reading through the C runtime, like luau-lsp, open files
+        // without FILE_SHARE_DELETE, so the file can't be replaced meanwhile.
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+
+        let sourcemap_dir = tempfile::tempdir().unwrap();
+        let temp_path = sourcemap_dir.path().join(".sourcemap.json.tmp");
+        let sourcemap_output = sourcemap_dir.path().join("sourcemap.json");
+        fs_err::write(&temp_path, "new sourcemap").unwrap();
+        fs_err::write(&sourcemap_output, "old sourcemap").unwrap();
+
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&sourcemap_output)
+            .unwrap();
+        let reader = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            drop(reader);
+        });
+
+        super::replace_file(&temp_path, &sourcemap_output).unwrap();
+        reader.join().unwrap();
+
+        assert_eq!(
+            fs_err::read_to_string(&sourcemap_output).unwrap(),
+            "new sourcemap"
+        );
+    }
 
     #[test]
     fn patches_for_instances_that_are_gone_affect_the_sourcemap() {
