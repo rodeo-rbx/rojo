@@ -1,0 +1,22 @@
+name: Sync Upstream
+
+on:
+  workflow_dispatch:
+
+  schedule:
+  - cron: '0 6 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync master with upstream
+    runs-on: ubuntu-latest
+    steps:
+    - name: Fast-forward master
+      run: gh repo sync ${{ github.repository }} --branch master
+      env:
+        # GITHUB_TOKEN can't push upstream commits that change workflow files;
+        # a SYNC_TOKEN secret with the workflow scope covers those.
+        GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
