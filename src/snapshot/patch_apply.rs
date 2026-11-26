@@ -119,8 +119,19 @@ fn finalize_patch_application(context: PatchApplyContext, tree: &mut RojoTree) -
     let mut real_rewrites = Vec::new();
     for (id, map) in context.attribute_refs_to_rewrite {
         for (prop_name, prop_value) in map {
-            if let Some(target) = tree.get_specified_id(&RojoRef::new(prop_value)) {
+            let rojo_ref = RojoRef::new(prop_value);
+            if let Some(target) = tree.get_specified_id(&rojo_ref) {
                 real_rewrites.push((prop_name, Variant::Ref(target)))
+            } else {
+                // Left as the snapshot gave it, as patch_compute's compute_ref_properties does
+                let name = tree
+                    .get_instance(id)
+                    .expect("Invalid instance ID in deferred attribute ref map")
+                    .name();
+                log::warn!(
+                    "{REF_POINTER_ATTRIBUTE_PREFIX}{prop_name} on {name} names the ID {rojo_ref}, \
+                    which no instance or more than one instance has; it doesn't set {prop_name}"
+                );
             }
         }
         let mut instance = tree

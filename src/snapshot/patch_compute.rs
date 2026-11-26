@@ -145,20 +145,16 @@ fn compute_property_patches(
         changed_properties.insert(*name, None);
     }
 
-    for (name, ref_value) in attribute_ref_properties {
-        match (&ref_value, instance.properties().get(&name)) {
-            (Some(referent), Some(instance_value)) => {
-                if referent != instance_value {
-                    changed_properties.insert(name, ref_value);
-                } else {
-                    changed_properties.remove(&name);
-                }
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                changed_properties.insert(name, ref_value);
-            }
-            (None, None) => {
+    // A Ref an attribute resolves to overrides the snapshot's own value for that property. One it
+    // doesn't resolve to isn't in the map, so the comparison above stands for it, as when the patch
+    // is applied (patch_apply's finalize_patch_application).
+    for (name, referent) in attribute_ref_properties {
+        match instance.properties().get(&name) {
+            Some(instance_value) if &referent == instance_value => {
                 changed_properties.remove(&name);
+            }
+            _ => {
+                changed_properties.insert(name, Some(referent));
             }
         }
     }
@@ -275,10 +271,11 @@ fn compute_children_patches(
     }
 }
 
-fn compute_ref_properties(
-    snapshot: &InstanceSnapshot,
-    tree: &RojoTree,
-) -> UstrMap<Option<Variant>> {
+/// The Ref properties the snapshot's `Rojo_Target_*` attributes resolve to. An attribute naming an
+/// ID that no instance, or more than one, has is left out, so it doesn't override the property:
+/// a model file keeps the Ref it carries itself, and a property only an attribute gave is removed
+/// by the ordinary comparison, as the snapshot doesn't have it.
+fn compute_ref_properties(snapshot: &InstanceSnapshot, tree: &RojoTree) -> UstrMap<Variant> {
     let mut map = UstrMap::new();
     let attributes = match snapshot.properties.get(&ustr("Attributes")) {
         Some(Variant::Attributes(attrs)) => attrs,
@@ -312,9 +309,13 @@ fn compute_ref_properties(
             }
         };
         if let Some(target_id) = tree.get_specified_id(&rojo_ref) {
-            map.insert(ustr(prop_name), Some(Variant::Ref(target_id)));
+            map.insert(ustr(prop_name), Variant::Ref(target_id));
         } else {
-            map.insert(ustr(prop_name), None);
+            log::warn!(
+                "{attr_name} on {} names the ID {rojo_ref}, which no instance or more than one \
+                instance has; it doesn't set {prop_name}",
+                snapshot.name
+            );
         }
     }
 
@@ -326,6 +327,8 @@ mod test {
     use super::*;
 
     use std::borrow::Cow;
+
+    use rbx_dom_weak::types::Attributes;
 
     /// This test makes sure that rewriting refs in instance update patches to
     /// instances that already exists works. We should be able to correlate the
@@ -368,6 +371,71 @@ mod test {
         };
 
         assert_eq!(patch_set, expected_patch_set);
+    }
+
+    /// A model file can carry a Ref property and also a `Rojo_Target_*`
+    /// attribute for it (syncback writes both). When the attribute's ID
+    /// doesn't resolve, here because two instances share it (one model copied
+    /// from another), recomputing the file must keep the Ref it carries, as
+    /// applying it did, instead of removing it.
+    #[test]
+    fn unresolved_ref_attribute_keeps_own_ref() {
+        let mut attributes = Attributes::new();
+        attributes.insert("Rojo_Target_Value".into(), Variant::String("shared".into()));
+
+        let mut tree = RojoTree::new(
+            InstanceSnapshot::new()
+                .name("root")
+                .class_name("Folder")
+                .children(vec![
+                    InstanceSnapshot::new().name("Target").class_name("Folder"),
+                    InstanceSnapshot::new().name("Other").class_name("Folder"),
+                    InstanceSnapshot::new()
+                        .name("Pointer")
+                        .class_name("ObjectValue")
+                        .property("Attributes", attributes.clone()),
+                ]),
+        );
+        let root_id = tree.get_root_id();
+        let children = tree.root().children().to_vec();
+        let (target_id, other_id, pointer_id) = (children[0], children[1], children[2]);
+        tree.set_specified_id(target_id, RojoRef::new("shared".into()));
+        tree.set_specified_id(other_id, RojoRef::new("shared".into()));
+        tree.get_instance_mut(pointer_id)
+            .unwrap()
+            .properties_mut()
+            .insert(ustr("Value"), Variant::Ref(target_id));
+
+        // The same file read again: the pointer's own Value points at Target
+        let target_snapshot_id = Ref::new();
+        let snapshot = InstanceSnapshot::new()
+            .name("root")
+            .class_name("Folder")
+            .children(vec![
+                InstanceSnapshot::new()
+                    .name("Target")
+                    .class_name("Folder")
+                    .snapshot_id(target_snapshot_id),
+                InstanceSnapshot::new().name("Other").class_name("Folder"),
+                InstanceSnapshot::new()
+                    .name("Pointer")
+                    .class_name("ObjectValue")
+                    .property("Attributes", attributes)
+                    .property("Value", Variant::Ref(target_snapshot_id)),
+            ]);
+
+        let patch_set = compute_patch_set(Some(snapshot), &tree, root_id);
+
+        for update in &patch_set.updated_instances {
+            if let Some(value) = update.changed_properties.get(&ustr("Value")) {
+                assert_eq!(
+                    value,
+                    &Some(Variant::Ref(target_id)),
+                    "Pointer.Value must keep pointing at Target"
+                );
+            }
+        }
+        assert!(patch_set.removed_instances.is_empty());
     }
 
     /// The same as rewrite_ref_existing_instance_update, except that the
